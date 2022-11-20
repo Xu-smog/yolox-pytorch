@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .varifocalloss import VarifocalLoss
+
 
 class IOUloss(nn.Module):
     def __init__(self, reduction="none", loss_type="iou"):
@@ -57,7 +59,7 @@ class IOUloss(nn.Module):
         return loss
 
 class YOLOLoss(nn.Module):    
-    def __init__(self, num_classes, fp16, strides=[8, 16, 32]):
+    def __init__(self, num_classes, fp16, strides=[8, 16, 32], loss_type=None):
         super().__init__()
         self.num_classes        = num_classes
         self.strides            = strides
@@ -66,6 +68,10 @@ class YOLOLoss(nn.Module):
         self.iou_loss           = IOUloss(reduction="none")
         self.grids              = [torch.zeros(1)] * len(strides)
         self.fp16               = fp16
+
+        # add FocalLoss and VariFocalLoss
+        self.loss_type = loss_type
+        self.varifocal = VarifocalLoss(reduction='none')
 
     def forward(self, inputs, labels=None):
         outputs             = []
@@ -106,6 +112,14 @@ class YOLOLoss(nn.Module):
         output[..., :2]     = (output[..., :2] + grid.type_as(output)) * stride
         output[..., 2:4]    = torch.exp(output[..., 2:4]) * stride
         return output, grid
+
+    def focal_loss(self, pred, gt):
+        pos_inds = gt.eq(1).float()
+        neg_inds = gt.eq(0).float()
+        pos_loss = torch.log(pred+1e-5) * torch.pow(1 - pred, 2) * pos_inds * 0.75
+        neg_loss = torch.log(1 - pred+1e-5) * torch.pow(pred, 2) * neg_inds * 0.25
+        loss = -(pos_loss + neg_loss)
+        return loss
 
     def get_losses(self, x_shifts, y_shifts, expanded_strides, labels, outputs):
         #-----------------------------------------------#
@@ -179,7 +193,12 @@ class YOLOLoss(nn.Module):
 
         num_fg      = max(num_fg, 1)
         loss_iou    = (self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets)).sum()
-        loss_obj    = (self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)).sum()
+        if self.loss_type is None:
+            loss_obj    = (self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)).sum()
+        elif self.loss_type == 'FocalLoss':
+            loss_obj = (self.focal_loss(obj_preds.sigmoid().view(-1, 1), obj_targets)).sum() / num_fg
+        elif self.loss_type == 'VariFocalLoss':
+            loss_obj = (self.varifocal(obj_preds.view(-1, 1), obj_targets)).sum() / num_fg
         loss_cls    = (self.bcewithlog_loss(cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets)).sum()
         reg_weight  = 5.0
         loss = reg_weight * loss_iou + loss_obj + loss_cls
